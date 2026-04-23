@@ -8,8 +8,14 @@ Setup:
 """
 
 import numpy as np
-import sounddevice as sd
 import librosa
+
+try:
+    import sounddevice as sd
+    SD_AVAILABLE = True
+except (ImportError, OSError):
+    sd = None
+    SD_AVAILABLE = False
 import joblib
 import time
 from collections import deque
@@ -50,7 +56,11 @@ def find_mac_microphone() -> int | None:
       3. System default input device
     Returns: device index (int) or None (use system default)
     """
-    devices = sd.query_devices()
+    if not SD_AVAILABLE:
+        return None
+
+    assert sd is not None
+    devices       = sd.query_devices()
     default_input = sd.default.device[0]
 
     candidates = []
@@ -85,6 +95,9 @@ class MicrophoneCapture:
     NOTE — macOS permissions:
       On first run the system will ask for microphone access.
       System Settings → Privacy & Security → Microphone → Terminal ✓
+
+    When sounddevice is unavailable (e.g. Streamlit Cloud) all methods
+    raise RuntimeError — use app.py's IS_CLOUD guard before calling capture().
     """
 
     def __init__(self, sample_rate=SAMPLE_RATE, duration=DURATION, device="auto"):
@@ -92,15 +105,17 @@ class MicrophoneCapture:
         self.duration    = duration
         self.n_samples   = int(sample_rate * duration)
 
-        if device == "auto":
-            self.device = find_mac_microphone()
-        else:
-            self.device = device
+        if not SD_AVAILABLE:
+            self.device = None
+            return
 
+        self.device = find_mac_microphone() if device == "auto" else device
         self._validate_device()
 
     def _validate_device(self):
         """Warn if the device's native sample rate differs from the target."""
+        if not SD_AVAILABLE:
+            return
         try:
             dev_info   = sd.query_devices(self.device, "input")
             default_sr = int(dev_info["default_samplerate"])
@@ -118,6 +133,8 @@ class MicrophoneCapture:
         Returns: (n_samples,) float32 array.
         CoreAudio on macOS adds ~10–20 ms latency — expected behaviour.
         """
+        if not SD_AVAILABLE:
+            raise RuntimeError("sounddevice / PortAudio not available on this platform.")
         try:
             audio = sd.rec(
                 frames     = self.n_samples,
@@ -135,6 +152,9 @@ class MicrophoneCapture:
 
     def list_devices(self):
         """Print all audio devices — use this to find the correct device index."""
+        if not SD_AVAILABLE:
+            print("[Mic] sounddevice not available — cannot list devices.")
+            return
         print("\n── Audio Devices ──")
         for idx, dev in enumerate(sd.query_devices()):
             tag = ""
