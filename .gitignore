@@ -1,0 +1,21 @@
+# Model & generated files
+drone_model.joblib
+.alarm_tone.wav
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# HuggingFace cache
+~/.cache/huggingface/
+
+# macOS
+.DS_Store
+.localized
+
+# Streamlit
+.streamlit/
