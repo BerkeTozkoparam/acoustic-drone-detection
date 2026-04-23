@@ -1,5 +1,4 @@
-# Model & generated files
-drone_model.joblib
+# Generated files
 .alarm_tone.wav
 
 # Python

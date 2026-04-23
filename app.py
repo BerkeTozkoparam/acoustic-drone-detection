@@ -1,6 +1,8 @@
 """
 Streamlit dashboard — real-time acoustic drone detection.
-Run: streamlit run app.py
+
+Local run  : streamlit run app.py   (live microphone + alarm sound)
+Cloud run  : deployed on Streamlit Cloud (demo mode with synthetic audio)
 """
 import sys, os, time
 sys.path.insert(0, os.path.dirname(__file__))
@@ -11,19 +13,27 @@ import plotly.graph_objects as go
 import librosa
 import soundfile as sf
 import subprocess
-import os as _os
+
+# Microphone + alarm sound only available locally
+try:
+    import sounddevice as sd
+    MIC_AVAILABLE = True
+except (ImportError, OSError):
+    MIC_AVAILABLE = False
 
 from acoustic_pipeline import (
     AcousticDronePipeline, DecisionEngine,
     SAMPLE_RATE, N_FFT, HOP_LENGTH, N_MFCC,
 )
 
-MODEL      = _os.path.join(_os.path.dirname(__file__), "drone_model.joblib")
-_ALARM_WAV = _os.path.join(_os.path.dirname(__file__), ".alarm_tone.wav")
+MODEL      = os.path.join(os.path.dirname(__file__), "drone_model.joblib")
+_ALARM_WAV = os.path.join(os.path.dirname(__file__), ".alarm_tone.wav")
+
+IS_CLOUD = not MIC_AVAILABLE  # running on Streamlit Cloud or similar
 
 
+# ── Alarm sound (local only) ──────────────────────────────────
 def _generate_alarm_wav(volume: float = 0.6):
-    """Write the alarm tone to a WAV file (regenerated whenever volume changes)."""
     sr   = 44100
     dur  = 0.4
     t    = np.linspace(0, dur, int(sr * dur), endpoint=False)
@@ -35,9 +45,22 @@ def _generate_alarm_wav(volume: float = 0.6):
 
 
 def play_alarm(volume: float = 0.6):
-    """Play the alarm via macOS afplay — avoids PortAudio stream conflicts."""
+    """Play alarm via macOS afplay — avoids PortAudio stream conflicts."""
+    if IS_CLOUD:
+        return
     _generate_alarm_wav(volume)
     subprocess.Popen(["afplay", _ALARM_WAV])
+
+
+# ── Synthetic audio for cloud demo ───────────────────────────
+def _synthetic_frame(is_drone: bool = False) -> np.ndarray:
+    """Generate a fake 1-second audio frame for demo purposes."""
+    rng  = np.random.default_rng()
+    freq = 120.0 if is_drone else 440.0
+    t    = np.linspace(0, 1.0, SAMPLE_RATE, endpoint=False)
+    wave = np.sin(2 * np.pi * freq * t).astype(np.float32)
+    wave += rng.normal(0, 0.05, SAMPLE_RATE).astype(np.float32)
+    return wave
 
 
 # ── Page config ───────────────────────────────────────────────
@@ -75,22 +98,21 @@ def _init():
             p.classifier.load(MODEL)
         except FileNotFoundError:
             st.error(
-                f"Model not found: {MODEL}\n"
-                "Run `python acoustic_pipeline.py` first to train and save the model."
+                "**Model not found.**  \n"
+                "Run `python acoustic_pipeline.py` locally to train and save "
+                "`drone_model.joblib`, then redeploy."
             )
             st.stop()
         st.session_state.pipeline = p
 
     defaults = dict(
-        running    = False,
-        frame_count= 0,
-        conf_hist  = [],
-        alarm_hist = [],
-        log        = [],
-        last_conf  = 0.0,
-        last_alarm = False,
-        last_ratio = 0.0,
-        prev_alarm = False,  # track alarm edge (False → True) to avoid repeat beeps
+        running     = False,
+        frame_count = 0,
+        conf_hist   = [],
+        alarm_hist  = [],
+        log         = [],
+        prev_alarm  = False,
+        demo_drone  = False,   # cloud demo toggle
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -104,22 +126,38 @@ with st.sidebar:
     st.header("⚙️ Settings")
 
     threshold   = st.slider("Drone confidence threshold", 0.1, 0.95, 0.60, 0.05,
-                            help="Minimum probability score to flag a frame as drone")
+                            help="Minimum probability to flag a frame as drone")
     window_size = st.slider("Sliding window size", 3, 15, 5,
                             help="Number of frames used for majority vote")
     alarm_ratio = st.slider("Alarm ratio", 0.2, 1.0, 0.60, 0.10,
-                            help="Fraction of window frames that must be drone to trigger alarm")
+                            help="Drone fraction in window required to trigger alarm")
     history_len = st.slider("Chart history length", 20, 200, 60)
 
     st.divider()
     st.subheader("🔔 Alarm Sound")
-    sound_on = st.toggle("Enable alarm sound", value=True)
-    volume   = st.slider("Volume", 0.1, 1.0, 0.6, 0.05, disabled=not sound_on)
+    if IS_CLOUD:
+        st.caption("Sound unavailable on Streamlit Cloud.")
+        sound_on = False
+        volume   = 0.6
+    else:
+        sound_on = st.toggle("Enable alarm sound", value=True)
+        volume   = st.slider("Volume", 0.1, 1.0, 0.6, 0.05, disabled=not sound_on)
+
+    if IS_CLOUD:
+        st.divider()
+        st.subheader("🎭 Demo Mode")
+        st.session_state.demo_drone = st.toggle(
+            "Simulate drone audio",
+            value=st.session_state.demo_drone,
+            help="Feed synthetic drone-like audio instead of a real microphone"
+        )
 
     st.divider()
     st.caption("Model: `drone_model.joblib`")
     st.caption(f"SR: {SAMPLE_RATE} Hz | Window: 1 s")
     st.caption(f"MFCC: {N_MFCC} | FFT: {N_FFT}")
+    if IS_CLOUD:
+        st.caption("⚠️ Running in cloud demo mode — no microphone access.")
 
     if st.button("🗑 Clear history", use_container_width=True):
         st.session_state.conf_hist  = []
@@ -133,24 +171,23 @@ with st.sidebar:
 pipeline = st.session_state.pipeline
 pipeline.engine.alarm_ratio = alarm_ratio
 
-# Recreate DecisionEngine if window_size changed
 if getattr(pipeline.engine, "_window_size", None) != window_size:
     pipeline.engine = DecisionEngine(window_size=window_size, alarm_ratio=alarm_ratio)
     pipeline.engine._window_size = window_size
 
-# Propagate threshold to the classifier module
 import acoustic_pipeline as _ap
 _ap.THRESHOLD = threshold
 
 
 # ── Title ─────────────────────────────────────────────────────
 st.title("🚁 Acoustic Drone Detection System")
-st.caption("Real-time microphone-based drone detection · MacBook Air Microphone")
+mode_label = "☁️ Cloud demo mode — synthetic audio" if IS_CLOUD else "🎙️ Live microphone · MacBook Air"
+st.caption(f"Real-time microphone-based drone detection · {mode_label}")
 
 # ── Control buttons ───────────────────────────────────────────
 c1, c2, _ = st.columns([1, 1, 5])
 with c1:
-    label    = "⏸ Stop"  if st.session_state.running else "▶ Start"
+    label    = "⏸ Stop"    if st.session_state.running else "▶ Start"
     btn_type = "secondary" if st.session_state.running else "primary"
     if st.button(label, type=btn_type, use_container_width=True):
         st.session_state.running = not st.session_state.running
@@ -163,7 +200,15 @@ st.divider()
 
 # ── Idle screen ───────────────────────────────────────────────
 if not st.session_state.running:
-    st.info("Press **▶ Start**, then play a drone sound near the microphone.")
+    if IS_CLOUD:
+        st.info(
+            "☁️ **Cloud demo mode** — no microphone available.  \n"
+            "Press **▶ Start** and toggle **Simulate drone audio** in the sidebar "
+            "to see the dashboard in action.  \n"
+            "For live detection, run `streamlit run app.py` locally."
+        )
+    else:
+        st.info("Press **▶ Start**, then play a drone sound near the microphone.")
 
     if st.session_state.frame_count > 0:
         st.subheader("Last session summary")
@@ -188,26 +233,26 @@ if not st.session_state.running:
     st.stop()
 
 
-# ── Capture audio frame ───────────────────────────────────────
-audio    = pipeline.mic.capture()
-decision = pipeline.process_frame(audio)
+# ── Capture / generate audio frame ───────────────────────────
+if IS_CLOUD:
+    audio = _synthetic_frame(is_drone=st.session_state.demo_drone)
+    time.sleep(0.3)   # simulate ~1s capture on cloud
+else:
+    audio = pipeline.mic.capture()
 
+decision    = pipeline.process_frame(audio)
 conf        = decision["raw_conf"]
 alarm       = decision["alarm"]
 raw_label   = decision["raw_label"]
 drone_ratio = decision["drone_ratio"]
 
-# Play alarm only on the rising edge (False → True transition)
+# Play alarm only on the rising edge (False → True)
 if sound_on and alarm and not st.session_state.prev_alarm:
     play_alarm(volume)
 st.session_state.prev_alarm = alarm
 
-# Update state
+# Update history
 st.session_state.frame_count += 1
-st.session_state.last_conf   = conf
-st.session_state.last_alarm  = alarm
-st.session_state.last_ratio  = drone_ratio
-
 st.session_state.conf_hist.append(conf)
 st.session_state.alarm_hist.append(int(alarm))
 if len(st.session_state.conf_hist) > history_len:
@@ -301,10 +346,8 @@ with mc:
         n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH
     )
     fig_m = go.Figure(data=go.Heatmap(
-        z=mfcc,
-        colorscale="Plasma",
-        showscale=True,
-        colorbar=dict(thickness=12)
+        z=mfcc, colorscale="Plasma",
+        showscale=True, colorbar=dict(thickness=12)
     ))
     fig_m.update_layout(
         height=260, margin=dict(l=0, r=0, t=0, b=0),
